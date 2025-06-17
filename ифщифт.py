@@ -23,7 +23,7 @@ BOT_TOKEN = "7540376211:AAFcqpRoyIIGkoC-cb6YCjY5ZPPdeRgHCHg"
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 # URL вашего приложения (замените на свой)
-WEBHOOK_URL = "https://baoban.osc-fr1.scalingo.io"
+WEBHOOK_URL = "https://baoban.osc-fr1.scalingo.io/webhook"
 
 # Инициализация базы данных
 def init_db():
