@@ -1,21 +1,46 @@
-import urllib.request
-import urllib.parse
+import os
 import json
 import time
 import threading
 import ssl
 from datetime import datetime, timedelta
 from typing import Dict
+from flask import Flask, request, jsonify
+import urllib.request
+import urllib.parse
+import sqlite3
+import schedule
+import random
+
+# Flask приложение
+app = Flask(__name__)
 
 # Игнорируем SSL сертификаты (для macOS)
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Токен бота (замените на свой)
+# Токен бота
 BOT_TOKEN = "7540376211:AAFcqpRoyIIGkoC-cb6YCjY5ZPPdeRgHCHg"
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
-# Хранилище данных пользователей
-user_data: Dict[int, Dict] = {}
+# URL вашего приложения (замените на свой)
+WEBHOOK_URL = "https://baoban.osc-fr1.scalingo.io"
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            sleep_hour INTEGER,
+            sleep_minute INTEGER,
+            notifications_active BOOLEAN DEFAULT 0,
+            last_notification TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
 
 # Агрессивные сообщения с разной степенью агрессивности
 AGGRESSIVE_MESSAGES = {
@@ -299,7 +324,6 @@ def make_request(url, data=None, method='GET'):
         print(f"Ошибка запроса: {e}")
         return None
 
-
 def send_message(chat_id, text, reply_markup=None):
     """Отправляет сообщение пользователю"""
     url = BASE_URL + "sendMessage"
@@ -312,17 +336,6 @@ def send_message(chat_id, text, reply_markup=None):
 
     return make_request(url, data, 'POST')
 
-
-def get_updates(offset=None):
-    """Получает обновления от Telegram"""
-    url = BASE_URL + "getUpdates"
-    params = {"timeout": 10}
-    if offset:
-        params["offset"] = offset
-
-    return make_request(url, params)
-
-
 def get_sleep_button():
     """Создает кнопку 'Ложусь спать'"""
     return {
@@ -334,93 +347,124 @@ def get_sleep_button():
         ]]
     }
 
+def save_user_data(chat_id, sleep_hour, sleep_minute, notifications_active=True):
+    """Сохраняет данные пользователя в БД"""
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users 
+        (chat_id, sleep_hour, sleep_minute, notifications_active)
+        VALUES (?, ?, ?, ?)
+    ''', (chat_id, sleep_hour, sleep_minute, notifications_active))
+    conn.commit()
+    conn.close()
 
-def get_next_day_buttons():
-    """Создает кнопки для установки времени на следующий день"""
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "⏰ Установить время на завтра",
-                    "callback_data": "set_tomorrow"
-                }
-            ],
-            [
-                {
-                    "text": "🔄 Повторить то же время",
-                    "callback_data": "repeat_time"
-                }
-            ]
-        ]
-    }
+def get_user_data(chat_id):
+    """Получает данные пользователя из БД"""
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE chat_id = ?', (chat_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
 
+def update_user_notifications(chat_id, active):
+    """Обновляет статус уведомлений пользователя"""
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE users SET notifications_active = ? WHERE chat_id = ?
+    ''', (active, chat_id))
+    conn.commit()
+    conn.close()
 
-def schedule_notifications(user_id, sleep_hour, sleep_minute):
-    """Запускает поток для отправки уведомлений"""
+def get_users_for_notification(target_time):
+    """Получает пользователей для уведомления в определенное время"""
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT chat_id FROM users 
+        WHERE notifications_active = 1 
+        AND sleep_hour = ? AND sleep_minute = ?
+    ''', (target_time.hour, target_time.minute))
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
 
-    def notification_worker():
-        import random
-
-        # Время сна
-        now = datetime.now()
-        sleep_time = now.replace(hour=sleep_hour, minute=sleep_minute, second=0, microsecond=0)
-
-        # Если время уже прошло сегодня, переносим на завтра
-        if sleep_time <= now:
-            sleep_time += timedelta(days=1)
-
-        print(f"Запланированы уведомления для пользователя {user_id} на {sleep_time}")
-
-        # Расписание уведомлений (в минутах до времени сна)
-        notification_times = [60, 30, 20, 10, 5, 0]
-
-        for minutes_before in notification_times:
-            if not user_data.get(user_id, {}).get("notifications_active", False):
-                print(f"Уведомления отключены для пользователя {user_id}")
-                break
-
+def send_notifications_for_time(minutes_before):
+    """Отправляет уведомления за определенное количество минут до сна"""
+    current_time = datetime.now()
+    
+    # Ищем пользователей, которым нужно отправить уведомление
+    conn = sqlite3.connect('bot.db')
+    cursor = conn.cursor()
+    
+    for hour in range(24):
+        for minute in range(0, 60, 5):  # Проверяем каждые 5 минут
+            sleep_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
             notification_time = sleep_time - timedelta(minutes=minutes_before)
+            
+            # Если время уведомления совпадает с текущим (с точностью до минуты)
+            if abs((notification_time - current_time).total_seconds()) < 60:
+                cursor.execute('''
+                    SELECT chat_id FROM users 
+                    WHERE notifications_active = 1 
+                    AND sleep_hour = ? AND sleep_minute = ?
+                ''', (hour, minute))
+                
+                users = cursor.fetchall()
+                for (chat_id,) in users:
+                    message = random.choice(AGGRESSIVE_MESSAGES[minutes_before])
+                    send_message(chat_id, message, get_sleep_button())
+                    print(f"Отправлено уведомление пользователю {chat_id} за {minutes_before} минут")
+    
+    conn.close()
 
-            # Ждем до времени уведомления
-            wait_seconds = (notification_time - datetime.now()).total_seconds()
-            print(f"Ждем {wait_seconds} секунд до уведомления за {minutes_before} минут")
+# Планировщик задач
+def setup_scheduler():
+    """Настраивает планировщик для отправки уведомлений"""
+    # Каждую минуту проверяем все типы уведомлений
+    schedule.every().minute.do(lambda: send_notifications_for_time(60))
+    schedule.every().minute.do(lambda: send_notifications_for_time(30))
+    schedule.every().minute.do(lambda: send_notifications_for_time(20))
+    schedule.every().minute.do(lambda: send_notifications_for_time(10))
+    schedule.every().minute.do(lambda: send_notifications_for_time(5))
+    schedule.every().minute.do(lambda: send_notifications_for_time(0))
 
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
+def run_scheduler():
+    """Запускает планировщик в отдельном потоке"""
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
-            # Проверяем, активны ли уведомления
-            if not user_data.get(user_id, {}).get("notifications_active", False):
-                print(f"Уведомления отключены для пользователя {user_id}")
-                break
+# Webhook endpoint
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Обрабатывает входящие сообщения от Telegram"""
+    try:
+        update = request.get_json()
+        
+        if "message" in update:
+            handle_message(update["message"])
+        elif "callback_query" in update:
+            handle_callback_query(update["callback_query"])
+            
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        print(f"Ошибка webhook: {e}")
+        return jsonify({"status": "error"}), 500
 
-            # Отправляем уведомление
-            message = random.choice(AGGRESSIVE_MESSAGES[minutes_before])
-            print(f"Отправляем уведомление пользователю {user_id}: за {minutes_before} минут")
-            send_message(user_id, message, get_sleep_button())
-
-        # Уведомления после времени сна каждые 15 минут
-        while user_data.get(user_id, {}).get("notifications_active", False):
-            print(f"Ждем 15 минут для просроченного уведомления пользователю {user_id}")
-            time.sleep(900)  # 15 минут
-            if user_data.get(user_id, {}).get("notifications_active", False):
-                message = random.choice(AGGRESSIVE_MESSAGES["overdue"])
-                print(f"Отправляем просроченное уведомление пользователю {user_id}")
-                send_message(user_id, message, get_sleep_button())
-
-    # Запускаем в отдельном потоке
-    thread = threading.Thread(target=notification_worker, daemon=True)
-    thread.start()
-
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy"})
 
 def handle_message(message):
     """Обрабатывает текстовые сообщения"""
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
 
-    print(f"Получено сообщение от {chat_id}: {text}")
-
     if text == "/start":
-        user_data[chat_id] = {"sleep_time": None, "notifications_active": False}
         send_message(chat_id,
                      "🌙 Добро пожаловать в бот агрессивных напоминаний о сне!\n\n"
                      "Этот бот будет ЖЕСТКО напоминать тебе о времени сна.\n"
@@ -434,11 +478,8 @@ def handle_message(message):
                      "После этого я буду агрессивно напоминать тебе ложиться спать!")
 
     elif text == "/cancel":
-        if chat_id in user_data:
-            user_data[chat_id]["notifications_active"] = False
-            send_message(chat_id, "✅ Все напоминания отменены. Твоя лень победила.")
-        else:
-            send_message(chat_id, "❌ У тебя нет активных напоминаний.")
+        update_user_notifications(chat_id, False)
+        send_message(chat_id, "✅ Все напоминания отменены. Твоя лень победила.")
 
     else:
         # Пытаемся распарсить время
@@ -449,72 +490,34 @@ def handle_message(message):
                 minute = int(time_parts[1])
 
                 if 0 <= hour <= 23 and 0 <= minute <= 59:
-                    # Сохраняем время сна
-                    if chat_id not in user_data:
-                        user_data[chat_id] = {}
-
-                    # Отключаем старые уведомления
-                    user_data[chat_id]["notifications_active"] = False
-                    time.sleep(1)  # Даем время остановиться старым потокам
-
-                    user_data[chat_id]["sleep_time"] = (hour, minute)
-                    user_data[chat_id]["notifications_active"] = True
-
-                    # Запускаем уведомления
-                    schedule_notifications(chat_id, hour, minute)
-
-                    import random
-
-                    # Список вариативных фраз
+                    # Сохраняем время сна в БД
+                    save_user_data(chat_id, hour, minute, True)
+                    
                     sleep_messages = [
                         f"⏰ Время сна установлено: {text}\nТвой личный таймер самоуничтожения запущен. Успей лечь — или бот придёт за тобой.",
                         f"⏰ Всё, обратный отсчёт пошёл: {text}\nНапоминания будут. Терпение — закончится. Спать — это приказ.",
-                        f"⏰ Время сна зафиксировано: {text}\nРежим включён. Мягко не будет. Выключай всё и готовь тапочки.",
-                        f"⏰ Ты выбрал(а) спать в {text}.\nРешение принято. Жалобы не принимаются. Следующее уведомление — с угрозами.",
-                        f"⏰ Засекаю таймер до сна: {text}\nДальше будут тычки, крики и душевные страдания. Всё ради тебя 😈"
+                        f"⏰ Время сна зафиксировано: {text}\nРежим включён. Мягко не будет. Выключай всё и готовь тапочки."
                     ]
-
-                    # Выбираем случайное сообщение
+                    
                     selected_message = random.choice(sleep_messages)
-
-                    # Отправляем сообщение
-                    send_message(chat_id, text=selected_message)
+                    send_message(chat_id, selected_message)
                     send_message(chat_id, "😈😈😈")
+                else:
+                    send_message(chat_id, "❌ Неверный формат времени! Используй ЧЧ:ММ (например: 23:00)")
             else:
-                send_message(chat_id, "😈😈😈")
+                send_message(chat_id, "❌ Неверный формат! Введи время как ЧЧ:ММ")
         except ValueError:
-            send_message(chat_id, "😈😈😈")
-
+            send_message(chat_id, "❌ Неверный формат времени! Используй ЧЧ:ММ (например: 23:00)")
 
 def handle_callback_query(callback_query):
     """Обрабатывает нажатия кнопок"""
     chat_id = callback_query["message"]["chat"]["id"]
     data = callback_query["data"]
 
-    print(f"Получен callback от {chat_id}: {data}")
-
     if data == "going_to_sleep":
         # Отменяем уведомления
-        if chat_id in user_data:
-            user_data[chat_id]["notifications_active"] = False
-            print(f"Отключены уведомления для пользователя {chat_id}")
-
-        # Отвечаем на callback
-        callback_id = callback_query["id"]
-        url = BASE_URL + "answerCallbackQuery"
-        make_request(url, {"callback_query_id": callback_id}, 'POST')
-
-        # Редактируем сообщение с новыми кнопками
-        message_id = callback_query["message"]["message_id"]
-        url = BASE_URL + "editMessageText"
-        make_request(url, {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": "😴 Хорошо, напоминания остановлены.\nХоть что-то правильное сделал сегодня.\n\n💤 Спокойной ночи! Хочешь установить время на завтра?",
-            "reply_markup": get_next_day_buttons()
-        }, 'POST')
-
-    elif data == "set_tomorrow":
+        update_user_notifications(chat_id, False)
+        
         # Отвечаем на callback
         callback_id = callback_query["id"]
         url = BASE_URL + "answerCallbackQuery"
@@ -526,83 +529,31 @@ def handle_callback_query(callback_query):
         make_request(url, {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": "⏰ Введи время сна на завтра в формате ЧЧ:ММ (например: 23:00 или 22:30)"
+            "text": "😴 Хорошо, напоминания остановлены.\nХоть что-то правильное сделал сегодня.\n\n💤 Спокойной ночи!"
         }, 'POST')
 
-    elif data == "repeat_time":
-        # Отвечаем на callback
-        callback_id = callback_query["id"]
-        url = BASE_URL + "answerCallbackQuery"
-        make_request(url, {"callback_query_id": callback_id}, 'POST')
-
-        # Проверяем, есть ли сохраненное время
-        if chat_id in user_data and user_data[chat_id].get("sleep_time"):
-            hour, minute = user_data[chat_id]["sleep_time"]
-
-            # Устанавливаем то же время на завтра
-            user_data[chat_id]["notifications_active"] = True
-            schedule_notifications(chat_id, hour, minute)
-
-            # Редактируем сообщение
-            message_id = callback_query["message"]["message_id"]
-            url = BASE_URL + "editMessageText"
-            make_request(url, {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": f"🔄 Отлично! Время сна на завтра: {hour:02d}:{minute:02d}\n\nБуду так же жестко напоминать! 🔥"
-            }, 'POST')
-        else:
-            # Если времени нет, просим ввести
-            message_id = callback_query["message"]["message_id"]
-            url = BASE_URL + "editMessageText"
-            make_request(url, {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": "❌ У тебя нет сохраненного времени сна.\n⏰ Введи время в формате ЧЧ:ММ (например: 23:00)"
-            }, 'POST')
-
-
-def main():
-    """Главная функция бота"""
-    print("🤖 Бот запущен!")
-    print(f"Токен: {BOT_TOKEN[:10]}...")
-
-    # Проверяем токен
-    me_info = make_request(BASE_URL + "getMe")
-    if me_info and me_info.get("ok"):
-        bot_info = me_info["result"]
-        print(f"✅ Бот подключен: @{bot_info['username']} ({bot_info['first_name']})")
+def set_webhook():
+    """Устанавливает webhook"""
+    url = BASE_URL + "setWebhook"
+    data = {"url": WEBHOOK_URL}
+    result = make_request(url, data, 'POST')
+    if result and result.get("ok"):
+        print(f"✅ Webhook установлен: {WEBHOOK_URL}")
     else:
-        print("❌ Ошибка подключения к боту! Проверьте токен.")
-        return
-
-    offset = None
-
-    while True:
-        try:
-            print("📡 Получаем обновления...")
-            updates = get_updates(offset)
-
-            if updates and updates.get("ok"):
-                for update in updates["result"]:
-                    offset = update["update_id"] + 1
-
-                    if "message" in update:
-                        handle_message(update["message"])
-                    elif "callback_query" in update:
-                        handle_callback_query(update["callback_query"])
-            else:
-                print("⚠️ Нет обновлений или ошибка API")
-
-            time.sleep(2)
-
-        except KeyboardInterrupt:
-            print("\n🛑 Бот остановлен пользователем")
-            break
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            time.sleep(5)
-
+        print(f"❌ Ошибка установки webhook: {result}")
 
 if __name__ == "__main__":
-    main()
+    # Инициализация
+    init_db()
+    setup_scheduler()
+    
+    # Устанавливаем webhook
+    set_webhook()
+    
+    # Запускаем планировщик в отдельном потоке
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    
+    # Запускаем Flask приложение
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
