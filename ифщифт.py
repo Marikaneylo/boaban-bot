@@ -19,7 +19,7 @@ app = Flask(__name__)
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Токен бота из переменных окружения (ВАЖНО!)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7540376211:AAFcqpRoyIIGkoC-cb6YCjY5ZPPdeRgHCHg")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 # URL вашего приложения - получаем из переменных окружения
