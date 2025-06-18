@@ -23,8 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 # URL вашего приложения - получаем из переменных окружения
-APP_NAME = os.environ.get("APP_NAME", "baoban")
-WEBHOOK_URL = f"https://{APP_NAME}.osc-fr1.scalingo.io/webhook"
+
 
 # Инициализация базы данных
 def init_db():
